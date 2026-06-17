@@ -4,7 +4,8 @@ Use this folder for the simplest Surya flow:
 1. choose date window,
 2. download only required hourly files,
 3. run rollout inference,
-4. save one `prediction.nc`.
+4. save one `prediction.nc`,
+5. save one default visualization PNG in the output directory.
 
 ## Quick start
 
@@ -17,6 +18,12 @@ Non-interactive defaults:
 
 ```bash
 bash easy_inference/run_easy_inference.sh --no-prompt
+```
+
+Skip the visualization PNG:
+
+```bash
+bash easy_inference/run_easy_inference.sh --skip-visualization
 ```
 
 ## Config

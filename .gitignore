@@ -1,4 +1,4 @@
-# Compressed files
+# Compressed docker images
 *.tar
 # Byte-compiled / optimized / DLL files
 __pycache__/

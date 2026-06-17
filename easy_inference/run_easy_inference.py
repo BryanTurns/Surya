@@ -58,6 +58,7 @@ class InferenceSummary:
     avg_infer_seconds: float
     prediction_nc_path: str
     mode: str
+    visualization_path: str | None = None
 
 
 @dataclass
@@ -417,6 +418,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-gt",
         action="store_true",
         help="Skip ground-truth loading and loss computation for faster inference.",
+    )
+    parser.add_argument(
+        "--skip-visualization",
+        action="store_true",
+        help="Skip creating the default visualization PNG after inference.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1745,6 +1751,21 @@ def run_inference_pipeline(
     )
 
 
+def create_prediction_visualization(
+    prediction_nc_path: Path,
+    output_dir: Path,
+    show_progress: bool,
+) -> Path:
+    from visualize_prediction import visualize_prediction
+
+    output_path = output_dir / "surya_easy_inference_visualization.png"
+    log_progress(show_progress, f"creating visualization | output={output_path}")
+    return visualize_prediction(
+        input_path=prediction_nc_path,
+        output_path=output_path,
+    )
+
+
 def print_report(
     download_summary: DownloadSummary | None,
     inference_summary: InferenceSummary | None,
@@ -1778,6 +1799,8 @@ def print_report(
         print(f"Avg data sec         : {inference_summary.avg_data_seconds:.3f}")
         print(f"Avg infer sec        : {inference_summary.avg_infer_seconds:.3f}")
         print(f"Prediction file      : {inference_summary.prediction_nc_path}")
+        if inference_summary.visualization_path is not None:
+            print(f"Visualization image  : {inference_summary.visualization_path}")
         print("GT variables         : gt_<channel> (NaN where GT is unavailable)")
     print("=" * 72)
 
@@ -1818,6 +1841,10 @@ def main() -> int:
     print(f"Validation data dir  : {validation_data_dir}")
     print(f"Index CSV            : {index_path}")
     print(f"Prediction output    : {prediction_nc_path}")
+    if args.skip_visualization:
+        print("Visualization output : skipped")
+    else:
+        print(f"Visualization output : {output_dir / 'surya_easy_inference_visualization.png'}")
     print(f"Rollout steps        : {int(rollout_steps)}")
     print(f"Prediction steps     : {int(rollout_steps) + 1}")
     print(
@@ -1905,12 +1932,27 @@ def main() -> int:
             print(f"ERROR during inference: {exc}", file=sys.stderr)
             return 1
 
+        if not args.skip_visualization:
+            try:
+                visualization_path = create_prediction_visualization(
+                    prediction_nc_path=Path(inference_summary.prediction_nc_path),
+                    output_dir=output_dir,
+                    show_progress=show_progress,
+                )
+                inference_summary.visualization_path = str(visualization_path)
+            except Exception as exc:
+                print(f"ERROR during visualization: {exc}", file=sys.stderr)
+                return 1
+
         print_report(
             download_summary=download_summary,
             inference_summary=inference_summary,
             start_dt=start_dt,
             end_dt=end_dt,
         )
+        
+        
+
         return 0
     finally:
         debug_logger.close()
