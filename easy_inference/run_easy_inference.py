@@ -460,8 +460,16 @@ def parse_args() -> argparse.Namespace:
         "--aws-region",
         default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
         help=(
-            "AWS region for AWS CLI calls such as DynamoDB tracking and S3 sync. "
+            "AWS region for AWS CLI calls such as DynamoDB tracking, SNS alerts, and S3 sync. "
             "Defaults to AWS_REGION or AWS_DEFAULT_REGION when set."
+        ),
+    )
+    parser.add_argument(
+        "--sns-topic-arn",
+        default=os.environ.get("SNS_TOPIC_ARN"),
+        help=(
+            "Optional SNS topic ARN for error alerts. Defaults to SNS_TOPIC_ARN "
+            "when set."
         ),
     )
     parser.add_argument(
@@ -1853,13 +1861,6 @@ def sync_output_dir_to_s3(
     )
 
 
-def append_s3_run_prefix(output_s3_uri: str, run_start_iso: str) -> str:
-    output_s3_uri = output_s3_uri.strip()
-    if not output_s3_uri.startswith("s3://"):
-        raise ValueError(f"Output S3 URI must start with s3://, got: {output_s3_uri}")
-    return f"{output_s3_uri.rstrip('/')}/{run_start_iso}/"
-
-
 def update_dynamodb_run_status(
     tracker: DynamoDBRunTracker,
     completed: str,
@@ -1897,6 +1898,54 @@ def update_dynamodb_run_status(
         show_progress,
         f"dynamodb run status | table={tracker.table_name} start_datetime={tracker.start_datetime} completed={completed}",
     )
+
+
+def publish_sns_error_alert(
+    topic_arn: str,
+    run_start_iso: str,
+    error_text: str,
+    config_path: Path,
+    output_dir: Path,
+    output_s3_uri: str | None,
+    dynamodb_table: str | None,
+    aws_region: str | None,
+) -> None:
+    _ensure_aws_cli_available()
+    subject = f"Surya inference error {run_start_iso}"
+    message = "\n".join(
+        [
+            "Surya inference run failed.",
+            "",
+            f"Start time (UTC): {run_start_iso}",
+            f"Error: {error_text}",
+            "",
+            f"Config path: {config_path}",
+            f"Output directory: {output_dir}",
+            f"Output S3 URI: {output_s3_uri or 'not configured'}",
+            f"DynamoDB table: {dynamodb_table or 'not configured'}",
+            f"AWS region: {aws_region or 'default AWS CLI resolution'}",
+            f"Alert time (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        ]
+    )
+    command = ["aws"]
+    if aws_region:
+        command.extend(["--region", aws_region])
+    command.extend(
+        [
+            "sns",
+            "publish",
+            "--topic-arn",
+            topic_arn,
+            "--subject",
+            subject,
+            "--message",
+            message,
+        ]
+    )
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Failed publishing SNS error alert to {topic_arn}: {stderr}")
 
 
 def _imds_request(path: str, token: str | None = None, method: str = "GET") -> str:
@@ -2032,14 +2081,37 @@ def main() -> int:
     show_progress = bool(advanced_cfg["show_progress"])
     debug_logger = _create_debug_logger(advanced_cfg=advanced_cfg, output_dir=output_dir, config_dir=config_dir)
     aws_region = str(args.aws_region).strip() if args.aws_region else None
+    sns_topic_arn = str(args.sns_topic_arn).strip() if args.sns_topic_arn else None
+
+    def publish_error_alert(error_text: str, resolved_output_s3_uri: str | None) -> None:
+        if not sns_topic_arn:
+            return
+        try:
+            publish_sns_error_alert(
+                topic_arn=sns_topic_arn,
+                run_start_iso=run_start_iso,
+                error_text=error_text,
+                config_path=config_path,
+                output_dir=output_dir,
+                output_s3_uri=resolved_output_s3_uri,
+                dynamodb_table=str(args.dynamodb_table) if args.dynamodb_table else None,
+                aws_region=aws_region,
+            )
+        except Exception as sns_exc:
+            print(f"ERROR publishing SNS alert: {sns_exc}", file=sys.stderr)
+
     try:
         output_s3_uri = (
-            append_s3_run_prefix(str(args.output_s3_uri), run_start_iso)
+            str(args.output_s3_uri).strip()
             if args.output_s3_uri
             else None
         )
+        if output_s3_uri and not output_s3_uri.startswith("s3://"):
+            raise ValueError(f"Output S3 URI must start with s3://, got: {output_s3_uri}")
     except Exception as exc:
-        print(f"ERROR resolving output S3 URI: {exc}", file=sys.stderr)
+        error_text = f"ERROR resolving output S3 URI: {exc}"
+        print(error_text, file=sys.stderr)
+        publish_error_alert(error_text=error_text, resolved_output_s3_uri=None)
         return 1
     dynamodb_tracker = (
         DynamoDBRunTracker(
@@ -2063,6 +2135,7 @@ def main() -> int:
                 )
             except Exception as dynamodb_exc:
                 print(f"ERROR updating DynamoDB run status: {dynamodb_exc}", file=sys.stderr)
+        publish_error_alert(error_text=message, resolved_output_s3_uri=output_s3_uri)
         return 1
 
     print(f"Easy config          : {config_path}")
@@ -2092,6 +2165,10 @@ def main() -> int:
         )
     else:
         print("DynamoDB tracking    : disabled (set --dynamodb-table or DYNAMODB_TABLE)")
+    if sns_topic_arn:
+        print(f"SNS error alerts     : {sns_topic_arn}")
+    else:
+        print("SNS error alerts     : disabled (set --sns-topic-arn or SNS_TOPIC_ARN)")
     if args.stop_instance_on_complete:
         print(f"EC2 self-stop        : enabled (delay={int(args.stop_instance_delay_seconds)}s)")
     else:
