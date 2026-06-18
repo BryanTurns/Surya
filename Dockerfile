@@ -41,6 +41,10 @@ ENTRYPOINT [ "uv", "run", "python", "/Surya/easy_inference/run_easy_inference.py
 CMD [  "--config-path", "/config/easy_inference_docker_config.yaml" ]
 ###### END: easy_inference ######
 
+FROM easy_inference AS easy_inference_realtime
+
+ENTRYPOINT [ "/Surya/easy_inference/realtime.sh" ]
+
 ###### START: solar_flare_forcasting ######
 FROM dependencies AS solar_flare_forcasting
 

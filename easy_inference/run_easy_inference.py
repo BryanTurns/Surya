@@ -71,6 +71,12 @@ class CoverageSummary:
     missing_examples: list[str]
 
 
+@dataclass
+class OutputUploadSummary:
+    output_dir: str
+    output_s3_uri: str
+
+
 class DebugLogger:
     def __init__(self, enabled: bool, log_path: Path | None) -> None:
         self.enabled = bool(enabled)
@@ -423,6 +429,14 @@ def parse_args() -> argparse.Namespace:
         "--skip-visualization",
         action="store_true",
         help="Skip creating the default visualization PNG after inference.",
+    )
+    parser.add_argument(
+        "--output-s3-uri",
+        default=os.environ.get("OUTPUT_S3_URI"),
+        help=(
+            "Optional S3 URI to sync the output directory to after inference. "
+            "Defaults to OUTPUT_S3_URI when set."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -1766,9 +1780,38 @@ def create_prediction_visualization(
     )
 
 
+def sync_output_dir_to_s3(
+    output_dir: Path,
+    output_s3_uri: str,
+    show_progress: bool,
+) -> OutputUploadSummary:
+    _ensure_aws_cli_available()
+    output_s3_uri = output_s3_uri.strip()
+    if not output_s3_uri.startswith("s3://"):
+        raise ValueError(f"Output S3 URI must start with s3://, got: {output_s3_uri}")
+
+    log_progress(show_progress, f"syncing output dir to S3 | {output_dir} -> {output_s3_uri}")
+    command = ["aws", "s3", "sync", str(output_dir), output_s3_uri]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=None, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Failed syncing output directory to {output_s3_uri}: {stderr}")
+
+    stdout = result.stdout.strip()
+    if stdout:
+        for line in stdout.splitlines():
+            log_progress(show_progress, f"s3 sync | {line}")
+    log_progress(show_progress, f"synced output dir to S3 | {output_s3_uri}")
+    return OutputUploadSummary(
+        output_dir=str(output_dir.resolve()),
+        output_s3_uri=output_s3_uri,
+    )
+
+
 def print_report(
     download_summary: DownloadSummary | None,
     inference_summary: InferenceSummary | None,
+    output_upload_summary: OutputUploadSummary | None,
     start_dt: datetime,
     end_dt: datetime,
 ) -> None:
@@ -1802,6 +1845,9 @@ def print_report(
         if inference_summary.visualization_path is not None:
             print(f"Visualization image  : {inference_summary.visualization_path}")
         print("GT variables         : gt_<channel> (NaN where GT is unavailable)")
+    if output_upload_summary is not None:
+        print(f"Uploaded output dir  : {output_upload_summary.output_dir}")
+        print(f"Uploaded S3 URI      : {output_upload_summary.output_s3_uri}")
     print("=" * 72)
 
 
@@ -1845,6 +1891,10 @@ def main() -> int:
         print("Visualization output : skipped")
     else:
         print(f"Visualization output : {output_dir / 'surya_easy_inference_visualization.png'}")
+    if args.output_s3_uri:
+        print(f"Output S3 sync       : {output_dir} -> {args.output_s3_uri}")
+    else:
+        print("Output S3 sync       : disabled (set --output-s3-uri or OUTPUT_S3_URI)")
     print(f"Rollout steps        : {int(rollout_steps)}")
     print(f"Prediction steps     : {int(rollout_steps) + 1}")
     print(
@@ -1944,14 +1994,26 @@ def main() -> int:
                 print(f"ERROR during visualization: {exc}", file=sys.stderr)
                 return 1
 
+        output_upload_summary: OutputUploadSummary | None = None
+        if args.output_s3_uri:
+            debug_logger.close()
+            try:
+                output_upload_summary = sync_output_dir_to_s3(
+                    output_dir=output_dir,
+                    output_s3_uri=str(args.output_s3_uri),
+                    show_progress=show_progress,
+                )
+            except Exception as exc:
+                print(f"ERROR during output S3 sync: {exc}", file=sys.stderr)
+                return 1
+
         print_report(
             download_summary=download_summary,
             inference_summary=inference_summary,
+            output_upload_summary=output_upload_summary,
             start_dt=start_dt,
             end_dt=end_dt,
         )
-        
-        
 
         return 0
     finally:

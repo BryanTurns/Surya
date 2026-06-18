@@ -26,6 +26,18 @@ Skip the visualization PNG:
 bash easy_inference/run_easy_inference.sh --skip-visualization
 ```
 
+Sync outputs to S3 after inference:
+
+```bash
+OUTPUT_S3_URI=s3://my-bucket/prefix bash easy_inference/run_easy_inference.sh
+```
+
+Or pass the URI explicitly:
+
+```bash
+bash easy_inference/run_easy_inference.sh --output-s3-uri s3://my-bucket/prefix
+```
+
 ## Config
 
 Edit `easy_inference/config_easy.yaml`.
