@@ -11,15 +11,13 @@ import re
 import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import cache
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import Any, Callable
 
 import h5netcdf
@@ -471,17 +469,6 @@ def parse_args() -> argparse.Namespace:
             "Optional SNS topic ARN for error alerts. Defaults to SNS_TOPIC_ARN "
             "when set."
         ),
-    )
-    parser.add_argument(
-        "--stop-instance-on-complete",
-        action="store_true",
-        help="Stop the current EC2 instance after a successful run.",
-    )
-    parser.add_argument(
-        "--stop-instance-delay-seconds",
-        type=int,
-        default=10,
-        help="Seconds to wait before stopping the EC2 instance. Defaults to 10.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1821,7 +1808,7 @@ def create_prediction_visualization(
 ) -> Path:
     from visualize_prediction import visualize_prediction
 
-    output_path = output_dir / "surya_easy_inference_visualization.png"
+    output_path = output_dir / "prediction.png"
     log_progress(show_progress, f"creating visualization | output={output_path}")
     return visualize_prediction(
         input_path=prediction_nc_path,
@@ -1946,67 +1933,6 @@ def publish_sns_error_alert(
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"Failed publishing SNS error alert to {topic_arn}: {stderr}")
-
-
-def _imds_request(path: str, token: str | None = None, method: str = "GET") -> str:
-    url = f"http://169.254.169.254/latest/{path.lstrip('/')}"
-    headers = {}
-    if token is not None:
-        headers["X-aws-ec2-metadata-token"] = token
-    request = urllib.request.Request(url=url, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return response.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Failed querying EC2 instance metadata at {url}: {exc}") from exc
-
-
-def _imds_v2_token() -> str:
-    url = "http://169.254.169.254/latest/api/token"
-    request = urllib.request.Request(
-        url=url,
-        headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-        method="PUT",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return response.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        raise RuntimeError(
-            "Failed getting EC2 metadata token. If running in Docker on EC2, "
-            "verify IMDS is enabled and HttpPutResponseHopLimit is at least 2."
-        ) from exc
-
-
-def resolve_current_ec2_identity() -> tuple[str, str]:
-    token = _imds_v2_token()
-    instance_id = _imds_request("meta-data/instance-id", token=token).strip()
-    identity_doc_raw = _imds_request("dynamic/instance-identity/document", token=token)
-    identity_doc = json.loads(identity_doc_raw)
-    region = str(identity_doc["region"])
-    if not instance_id or not region:
-        raise RuntimeError("Could not resolve current EC2 instance id and region from metadata.")
-    return instance_id, region
-
-
-def stop_current_ec2_instance(delay_seconds: int, show_progress: bool) -> None:
-    if delay_seconds < 0:
-        raise ValueError("stop-instance-delay-seconds must be >= 0.")
-    _ensure_aws_cli_available()
-    instance_id, region = resolve_current_ec2_identity()
-    if delay_seconds > 0:
-        log_progress(
-            show_progress,
-            f"stopping EC2 instance soon | instance_id={instance_id} region={region} delay_s={delay_seconds}",
-        )
-        sleep(delay_seconds)
-
-    command = ["aws", "ec2", "stop-instances", "--instance-ids", instance_id, "--region", region]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"Failed stopping EC2 instance {instance_id}: {stderr}")
-    log_progress(show_progress, f"stop-instances submitted | instance_id={instance_id} region={region}")
 
 
 def print_report(
@@ -2149,7 +2075,7 @@ def main() -> int:
     if args.skip_visualization:
         print("Visualization output : skipped")
     else:
-        print(f"Visualization output : {output_dir / 'surya_easy_inference_visualization.png'}")
+        print(f"Visualization output : {output_dir / 'prediction.png'}")
     if output_s3_uri:
         print(f"Output S3 sync       : {output_dir} -> {output_s3_uri}")
     else:
@@ -2169,10 +2095,6 @@ def main() -> int:
         print(f"SNS error alerts     : {sns_topic_arn}")
     else:
         print("SNS error alerts     : disabled (set --sns-topic-arn or SNS_TOPIC_ARN)")
-    if args.stop_instance_on_complete:
-        print(f"EC2 self-stop        : enabled (delay={int(args.stop_instance_delay_seconds)}s)")
-    else:
-        print("EC2 self-stop        : disabled")
     print(f"Rollout steps        : {int(rollout_steps)}")
     print(f"Prediction steps     : {int(rollout_steps) + 1}")
     print(
@@ -2301,16 +2223,6 @@ def main() -> int:
             start_dt=start_dt,
             end_dt=end_dt,
         )
-
-        if args.stop_instance_on_complete:
-            debug_logger.close()
-            try:
-                stop_current_ec2_instance(
-                    delay_seconds=int(args.stop_instance_delay_seconds),
-                    show_progress=show_progress,
-                )
-            except Exception as exc:
-                return fail_run(f"ERROR stopping EC2 instance: {exc}")
 
         if dynamodb_tracker is not None:
             try:

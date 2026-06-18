@@ -24,5 +24,5 @@ source .venv/bin/activate
 if [ -z "$*" ]; then
     uv run python /Surya/easy_inference/run_easy_inference.py --output-s3-uri "$s3_uri" --start-date "$start_date" --end-date "$end_date" --config-path "/config/easy_inference_docker_config.yaml" --no-prompt
 else
-    uv run python /Surya/easy_inference/run_easy_inference.py --start-date "$start_date" --end-date "$end_date" --no-prompt --stop-instance-on-complete --output-s3-uri "$s3_uri" --dynamodb-table "$dynamodb_table" --aws-region "$aws_region" --sns-topic-arn  "$sns_topic_arn"
+    uv run python /Surya/easy_inference/run_easy_inference.py --start-date "$start_date" --end-date "$end_date" --no-prompt --output-s3-uri "$s3_uri" --dynamodb-table "$dynamodb_table" --aws-region "$aws_region" --sns-topic-arn  "$sns_topic_arn"
 fi
