@@ -38,6 +38,30 @@ Or pass the URI explicitly:
 bash easy_inference/run_easy_inference.sh --output-s3-uri s3://my-bucket/prefix
 ```
 
+Outputs sync under an ISO UTC start-time prefix, for example
+`s3://my-bucket/prefix/2022-06-17T17:00:00Z/`.
+
+Track run completion in DynamoDB:
+
+```bash
+DYNAMODB_TABLE=surya-runs bash easy_inference/run_easy_inference.sh
+```
+
+Or pass the table explicitly:
+
+```bash
+bash easy_inference/run_easy_inference.sh --dynamodb-table surya-runs
+```
+
+The table must already exist with `start_datetime` as its partition key. The
+script writes `completed` as `no`, then `yes` or `error`.
+
+If AWS region is not already configured in the environment, pass it explicitly:
+
+```bash
+bash easy_inference/run_easy_inference.sh --dynamodb-table surya-runs --aws-region us-east-1
+```
+
 Stop the current EC2 instance after a successful run:
 
 ```bash
