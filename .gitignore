@@ -1,5 +1,7 @@
 # Compressed docker images
 *.tar
+# Output images
+*.png
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

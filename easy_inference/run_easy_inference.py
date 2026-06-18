@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import cache
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Callable
 
 import h5netcdf
@@ -437,6 +440,17 @@ def parse_args() -> argparse.Namespace:
             "Optional S3 URI to sync the output directory to after inference. "
             "Defaults to OUTPUT_S3_URI when set."
         ),
+    )
+    parser.add_argument(
+        "--stop-instance-on-complete",
+        action="store_true",
+        help="Stop the current EC2 instance after a successful run.",
+    )
+    parser.add_argument(
+        "--stop-instance-delay-seconds",
+        type=int,
+        default=10,
+        help="Seconds to wait before stopping the EC2 instance. Defaults to 10.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1808,6 +1822,67 @@ def sync_output_dir_to_s3(
     )
 
 
+def _imds_request(path: str, token: str | None = None, method: str = "GET") -> str:
+    url = f"http://169.254.169.254/latest/{path.lstrip('/')}"
+    headers = {}
+    if token is not None:
+        headers["X-aws-ec2-metadata-token"] = token
+    request = urllib.request.Request(url=url, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Failed querying EC2 instance metadata at {url}: {exc}") from exc
+
+
+def _imds_v2_token() -> str:
+    url = "http://169.254.169.254/latest/api/token"
+    request = urllib.request.Request(
+        url=url,
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            "Failed getting EC2 metadata token. If running in Docker on EC2, "
+            "verify IMDS is enabled and HttpPutResponseHopLimit is at least 2."
+        ) from exc
+
+
+def resolve_current_ec2_identity() -> tuple[str, str]:
+    token = _imds_v2_token()
+    instance_id = _imds_request("meta-data/instance-id", token=token).strip()
+    identity_doc_raw = _imds_request("dynamic/instance-identity/document", token=token)
+    identity_doc = json.loads(identity_doc_raw)
+    region = str(identity_doc["region"])
+    if not instance_id or not region:
+        raise RuntimeError("Could not resolve current EC2 instance id and region from metadata.")
+    return instance_id, region
+
+
+def stop_current_ec2_instance(delay_seconds: int, show_progress: bool) -> None:
+    if delay_seconds < 0:
+        raise ValueError("stop-instance-delay-seconds must be >= 0.")
+    _ensure_aws_cli_available()
+    instance_id, region = resolve_current_ec2_identity()
+    if delay_seconds > 0:
+        log_progress(
+            show_progress,
+            f"stopping EC2 instance soon | instance_id={instance_id} region={region} delay_s={delay_seconds}",
+        )
+        sleep(delay_seconds)
+
+    command = ["aws", "ec2", "stop-instances", "--instance-ids", instance_id, "--region", region]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Failed stopping EC2 instance {instance_id}: {stderr}")
+    log_progress(show_progress, f"stop-instances submitted | instance_id={instance_id} region={region}")
+
+
 def print_report(
     download_summary: DownloadSummary | None,
     inference_summary: InferenceSummary | None,
@@ -1895,6 +1970,10 @@ def main() -> int:
         print(f"Output S3 sync       : {output_dir} -> {args.output_s3_uri}")
     else:
         print("Output S3 sync       : disabled (set --output-s3-uri or OUTPUT_S3_URI)")
+    if args.stop_instance_on_complete:
+        print(f"EC2 self-stop        : enabled (delay={int(args.stop_instance_delay_seconds)}s)")
+    else:
+        print("EC2 self-stop        : disabled")
     print(f"Rollout steps        : {int(rollout_steps)}")
     print(f"Prediction steps     : {int(rollout_steps) + 1}")
     print(
@@ -2014,6 +2093,17 @@ def main() -> int:
             start_dt=start_dt,
             end_dt=end_dt,
         )
+
+        if args.stop_instance_on_complete:
+            debug_logger.close()
+            try:
+                stop_current_ec2_instance(
+                    delay_seconds=int(args.stop_instance_delay_seconds),
+                    show_progress=show_progress,
+                )
+            except Exception as exc:
+                print(f"ERROR stopping EC2 instance: {exc}", file=sys.stderr)
+                return 1
 
         return 0
     finally:

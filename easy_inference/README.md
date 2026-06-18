@@ -38,6 +38,15 @@ Or pass the URI explicitly:
 bash easy_inference/run_easy_inference.sh --output-s3-uri s3://my-bucket/prefix
 ```
 
+Stop the current EC2 instance after a successful run:
+
+```bash
+bash easy_inference/run_easy_inference.sh --stop-instance-on-complete
+```
+
+This requires the instance profile to allow `ec2:StopInstances`. When running inside
+Docker on EC2, the instance metadata hop limit must allow container access to IMDS.
+
 ## Config
 
 Edit `easy_inference/config_easy.yaml`.
