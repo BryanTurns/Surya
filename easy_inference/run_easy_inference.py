@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
 import re
 import shutil
@@ -58,6 +59,7 @@ class InferenceSummary:
     avg_infer_seconds: float
     prediction_nc_path: str
     mode: str
+    visualization_path: str | None = None
 
 
 @dataclass
@@ -68,6 +70,19 @@ class CoverageSummary:
     input_complete_references: int
     full_target_references: int
     missing_examples: list[str]
+
+
+@dataclass
+class OutputUploadSummary:
+    output_dir: str
+    output_s3_uri: str
+
+
+@dataclass
+class DynamoDBRunTracker:
+    table_name: str
+    start_datetime: str
+    aws_region: str | None = None
 
 
 class DebugLogger:
@@ -419,6 +434,43 @@ def parse_args() -> argparse.Namespace:
         help="Skip ground-truth loading and loss computation for faster inference.",
     )
     parser.add_argument(
+        "--skip-visualization",
+        action="store_true",
+        help="Skip creating the default visualization PNG after inference.",
+    )
+    parser.add_argument(
+        "--output-s3-uri",
+        default=os.environ.get("OUTPUT_S3_URI"),
+        help=(
+            "Optional S3 URI to sync the output directory to after inference. "
+            "Defaults to OUTPUT_S3_URI when set."
+        ),
+    )
+    parser.add_argument(
+        "--dynamodb-table",
+        default=os.environ.get("DYNAMODB_TABLE"),
+        help=(
+            "Optional DynamoDB table for run tracking. Defaults to DYNAMODB_TABLE "
+            "when set. The table must have start_datetime as its partition key."
+        ),
+    )
+    parser.add_argument(
+        "--aws-region",
+        default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
+        help=(
+            "AWS region for AWS CLI calls such as DynamoDB tracking, SNS alerts, and S3 sync. "
+            "Defaults to AWS_REGION or AWS_DEFAULT_REGION when set."
+        ),
+    )
+    parser.add_argument(
+        "--sns-topic-arn",
+        default=os.environ.get("SNS_TOPIC_ARN"),
+        help=(
+            "Optional SNS topic ARN for error alerts. Defaults to SNS_TOPIC_ARN "
+            "when set."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print resolved settings only.",
@@ -445,6 +497,10 @@ def _parse_datetime(value: str) -> datetime:
 
 def _format_datetime(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_datetime_iso_utc(value: datetime) -> str:
+    return value.replace(tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _prompt_datetime(label: str, default_value: datetime) -> datetime:
@@ -1745,9 +1801,144 @@ def run_inference_pipeline(
     )
 
 
+def create_prediction_visualization(
+    prediction_nc_path: Path,
+    output_dir: Path,
+    show_progress: bool,
+) -> Path:
+    from visualize_prediction import visualize_prediction
+
+    output_path = output_dir / "prediction.png"
+    log_progress(show_progress, f"creating visualization | output={output_path}")
+    return visualize_prediction(
+        input_path=prediction_nc_path,
+        output_path=output_path,
+    )
+
+
+def sync_output_dir_to_s3(
+    output_dir: Path,
+    output_s3_uri: str,
+    show_progress: bool,
+    aws_region: str | None = None,
+) -> OutputUploadSummary:
+    _ensure_aws_cli_available()
+    output_s3_uri = output_s3_uri.strip()
+    if not output_s3_uri.startswith("s3://"):
+        raise ValueError(f"Output S3 URI must start with s3://, got: {output_s3_uri}")
+
+    log_progress(show_progress, f"syncing output dir to S3 | {output_dir} -> {output_s3_uri}")
+    command = ["aws"]
+    if aws_region:
+        command.extend(["--region", aws_region])
+    command.extend(["s3", "sync", str(output_dir), output_s3_uri])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=None, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Failed syncing output directory to {output_s3_uri}: {stderr}")
+
+    stdout = result.stdout.strip()
+    if stdout:
+        for line in stdout.splitlines():
+            log_progress(show_progress, f"s3 sync | {line}")
+    log_progress(show_progress, f"synced output dir to S3 | {output_s3_uri}")
+    return OutputUploadSummary(
+        output_dir=str(output_dir.resolve()),
+        output_s3_uri=output_s3_uri,
+    )
+
+
+def update_dynamodb_run_status(
+    tracker: DynamoDBRunTracker,
+    completed: str,
+    show_progress: bool,
+) -> None:
+    if completed not in {"no", "yes", "error"}:
+        raise ValueError(f"Invalid DynamoDB completed status: {completed}")
+    _ensure_aws_cli_available()
+    command = ["aws"]
+    if tracker.aws_region:
+        command.extend(["--region", tracker.aws_region])
+    command.extend([
+        "dynamodb",
+        "update-item",
+        "--table-name",
+        tracker.table_name,
+        "--key",
+        json.dumps(
+            {
+                "start_datetime": {"S": tracker.start_datetime},
+            }
+        ),
+        "--update-expression",
+        "SET completed = :completed",
+        "--expression-attribute-values",
+        json.dumps({":completed": {"S": completed}}),
+    ])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"Failed updating DynamoDB run status to {completed} in {tracker.table_name}: {stderr}"
+        )
+    log_progress(
+        show_progress,
+        f"dynamodb run status | table={tracker.table_name} start_datetime={tracker.start_datetime} completed={completed}",
+    )
+
+
+def publish_sns_error_alert(
+    topic_arn: str,
+    run_start_iso: str,
+    error_text: str,
+    config_path: Path,
+    output_dir: Path,
+    output_s3_uri: str | None,
+    dynamodb_table: str | None,
+    aws_region: str | None,
+) -> None:
+    _ensure_aws_cli_available()
+    subject = f"Surya inference error {run_start_iso}"
+    message = "\n".join(
+        [
+            "Surya inference run failed.",
+            "",
+            f"Start time (UTC): {run_start_iso}",
+            f"Error: {error_text}",
+            "",
+            f"Config path: {config_path}",
+            f"Output directory: {output_dir}",
+            f"Output S3 URI: {output_s3_uri or 'not configured'}",
+            f"DynamoDB table: {dynamodb_table or 'not configured'}",
+            f"AWS region: {aws_region or 'default AWS CLI resolution'}",
+            f"Alert time (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        ]
+    )
+    command = ["aws"]
+    if aws_region:
+        command.extend(["--region", aws_region])
+    command.extend(
+        [
+            "sns",
+            "publish",
+            "--topic-arn",
+            topic_arn,
+            "--subject",
+            subject,
+            "--message",
+            message,
+        ]
+    )
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Failed publishing SNS error alert to {topic_arn}: {stderr}")
+
+
 def print_report(
     download_summary: DownloadSummary | None,
     inference_summary: InferenceSummary | None,
+    output_upload_summary: OutputUploadSummary | None,
     start_dt: datetime,
     end_dt: datetime,
 ) -> None:
@@ -1778,7 +1969,12 @@ def print_report(
         print(f"Avg data sec         : {inference_summary.avg_data_seconds:.3f}")
         print(f"Avg infer sec        : {inference_summary.avg_infer_seconds:.3f}")
         print(f"Prediction file      : {inference_summary.prediction_nc_path}")
+        if inference_summary.visualization_path is not None:
+            print(f"Visualization image  : {inference_summary.visualization_path}")
         print("GT variables         : gt_<channel> (NaN where GT is unavailable)")
+    if output_upload_summary is not None:
+        print(f"Uploaded output dir  : {output_upload_summary.output_dir}")
+        print(f"Uploaded S3 URI      : {output_upload_summary.output_s3_uri}")
     print("=" * 72)
 
 
@@ -1800,6 +1996,7 @@ def main() -> int:
         cli_rollout_steps=args.rollout_steps,
         use_prompt=prompt_for_dates,
     )
+    run_start_iso = _format_datetime_iso_utc(start_dt)
 
     output_dir = _resolve_path(str(user_cfg["output_dir"]), config_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1809,6 +2006,63 @@ def main() -> int:
     index_path = _resolve_path(str(advanced_cfg["index_path"]), config_dir)
     show_progress = bool(advanced_cfg["show_progress"])
     debug_logger = _create_debug_logger(advanced_cfg=advanced_cfg, output_dir=output_dir, config_dir=config_dir)
+    aws_region = str(args.aws_region).strip() if args.aws_region else None
+    sns_topic_arn = str(args.sns_topic_arn).strip() if args.sns_topic_arn else None
+
+    def publish_error_alert(error_text: str, resolved_output_s3_uri: str | None) -> None:
+        if not sns_topic_arn:
+            return
+        try:
+            publish_sns_error_alert(
+                topic_arn=sns_topic_arn,
+                run_start_iso=run_start_iso,
+                error_text=error_text,
+                config_path=config_path,
+                output_dir=output_dir,
+                output_s3_uri=resolved_output_s3_uri,
+                dynamodb_table=str(args.dynamodb_table) if args.dynamodb_table else None,
+                aws_region=aws_region,
+            )
+        except Exception as sns_exc:
+            print(f"ERROR publishing SNS alert: {sns_exc}", file=sys.stderr)
+
+    try:
+        output_s3_uri = (
+            str(args.output_s3_uri).strip()
+            if args.output_s3_uri
+            else None
+        )
+        if output_s3_uri and not output_s3_uri.startswith("s3://"):
+            raise ValueError(f"Output S3 URI must start with s3://, got: {output_s3_uri}")
+    except Exception as exc:
+        error_text = f"ERROR resolving output S3 URI: {exc}"
+        print(error_text, file=sys.stderr)
+        publish_error_alert(error_text=error_text, resolved_output_s3_uri=None)
+        return 1
+    dynamodb_tracker = (
+        DynamoDBRunTracker(
+            table_name=str(args.dynamodb_table),
+            start_datetime=run_start_iso,
+            aws_region=aws_region,
+        )
+        if args.dynamodb_table
+        else None
+    )
+    dynamodb_tracking_started = False
+
+    def fail_run(message: str) -> int:
+        print(message, file=sys.stderr)
+        if dynamodb_tracker is not None and dynamodb_tracking_started:
+            try:
+                update_dynamodb_run_status(
+                    tracker=dynamodb_tracker,
+                    completed="error",
+                    show_progress=show_progress,
+                )
+            except Exception as dynamodb_exc:
+                print(f"ERROR updating DynamoDB run status: {dynamodb_exc}", file=sys.stderr)
+        publish_error_alert(error_text=message, resolved_output_s3_uri=output_s3_uri)
+        return 1
 
     print(f"Easy config          : {config_path}")
     print(
@@ -1818,6 +2072,29 @@ def main() -> int:
     print(f"Validation data dir  : {validation_data_dir}")
     print(f"Index CSV            : {index_path}")
     print(f"Prediction output    : {prediction_nc_path}")
+    if args.skip_visualization:
+        print("Visualization output : skipped")
+    else:
+        print(f"Visualization output : {output_dir / 'prediction.png'}")
+    if output_s3_uri:
+        print(f"Output S3 sync       : {output_dir} -> {output_s3_uri}")
+    else:
+        print("Output S3 sync       : disabled (set --output-s3-uri or OUTPUT_S3_URI)")
+    if aws_region:
+        print(f"AWS region           : {aws_region}")
+    else:
+        print("AWS region           : default AWS CLI resolution")
+    if dynamodb_tracker is not None:
+        print(
+            "DynamoDB tracking    : "
+            f"{dynamodb_tracker.table_name} start_datetime={dynamodb_tracker.start_datetime}"
+        )
+    else:
+        print("DynamoDB tracking    : disabled (set --dynamodb-table or DYNAMODB_TABLE)")
+    if sns_topic_arn:
+        print(f"SNS error alerts     : {sns_topic_arn}")
+    else:
+        print("SNS error alerts     : disabled (set --sns-topic-arn or SNS_TOPIC_ARN)")
     print(f"Rollout steps        : {int(rollout_steps)}")
     print(f"Prediction steps     : {int(rollout_steps) + 1}")
     print(
@@ -1840,6 +2117,17 @@ def main() -> int:
         if args.dry_run:
             print("Dry run enabled. No download or inference executed.")
             return 0
+        if dynamodb_tracker is not None:
+            try:
+                update_dynamodb_run_status(
+                    tracker=dynamodb_tracker,
+                    completed="no",
+                    show_progress=show_progress,
+                )
+                dynamodb_tracking_started = True
+            except Exception as exc:
+                print(f"ERROR initializing DynamoDB run tracking: {exc}", file=sys.stderr)
+                return 1
 
         try:
             _validate_rollout_against_window(
@@ -1850,14 +2138,12 @@ def main() -> int:
                 rollout_steps=int(rollout_steps),
             )
         except Exception as exc:
-            print(f"ERROR rollout validation: {exc}", file=sys.stderr)
-            return 1
+            return fail_run(f"ERROR rollout validation: {exc}")
 
         try:
             ensure_model_assets(advanced_cfg=advanced_cfg, config_dir=config_dir)
         except Exception as exc:
-            print(f"ERROR downloading model assets: {exc}", file=sys.stderr)
-            return 1
+            return fail_run(f"ERROR downloading model assets: {exc}")
 
         download_summary: DownloadSummary | None = None
         if not args.skip_download:
@@ -1875,21 +2161,23 @@ def main() -> int:
                     show_progress=show_progress,
                 )
             except Exception as exc:
-                print(f"ERROR during download: {exc}", file=sys.stderr)
-                return 1
+                return fail_run(f"ERROR during download: {exc}")
         else:
             log_progress(show_progress, "skipping download by request")
 
         t_index = perf_counter()
-        build_index_csv_for_range(
-            validation_data_dir=validation_data_dir,
-            index_path=index_path,
-            start_datetime=start_dt,
-            end_datetime=end_dt,
-            cadence_minutes=int(advanced_cfg["cadence_minutes"]),
-        )
-        if debug_logger.enabled:
-            debug_logger.log("index_built", index_build_s=perf_counter() - t_index, index_path=str(index_path))
+        try:
+            build_index_csv_for_range(
+                validation_data_dir=validation_data_dir,
+                index_path=index_path,
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                cadence_minutes=int(advanced_cfg["cadence_minutes"]),
+            )
+            if debug_logger.enabled:
+                debug_logger.log("index_built", index_build_s=perf_counter() - t_index, index_path=str(index_path))
+        except Exception as exc:
+            return fail_run(f"ERROR building index CSV: {exc}")
 
         try:
             inference_summary = run_inference_pipeline(
@@ -1902,15 +2190,50 @@ def main() -> int:
                 skip_gt=bool(args.skip_gt),
             )
         except Exception as exc:
-            print(f"ERROR during inference: {exc}", file=sys.stderr)
-            return 1
+            return fail_run(f"ERROR during inference: {exc}")
+
+        if not args.skip_visualization:
+            try:
+                visualization_path = create_prediction_visualization(
+                    prediction_nc_path=Path(inference_summary.prediction_nc_path),
+                    output_dir=output_dir,
+                    show_progress=show_progress,
+                )
+                inference_summary.visualization_path = str(visualization_path)
+            except Exception as exc:
+                return fail_run(f"ERROR during visualization: {exc}")
+
+        output_upload_summary: OutputUploadSummary | None = None
+        if output_s3_uri:
+            debug_logger.close()
+            try:
+                output_upload_summary = sync_output_dir_to_s3(
+                    output_dir=output_dir,
+                    output_s3_uri=output_s3_uri,
+                    show_progress=show_progress,
+                    aws_region=aws_region,
+                )
+            except Exception as exc:
+                return fail_run(f"ERROR during output S3 sync: {exc}")
 
         print_report(
             download_summary=download_summary,
             inference_summary=inference_summary,
+            output_upload_summary=output_upload_summary,
             start_dt=start_dt,
             end_dt=end_dt,
         )
+
+        if dynamodb_tracker is not None:
+            try:
+                update_dynamodb_run_status(
+                    tracker=dynamodb_tracker,
+                    completed="yes",
+                    show_progress=show_progress,
+                )
+            except Exception as exc:
+                return fail_run(f"ERROR finalizing DynamoDB run tracking: {exc}")
+
         return 0
     finally:
         debug_logger.close()

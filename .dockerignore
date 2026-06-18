@@ -1,7 +1,13 @@
-# Compressed docker images
-*.tar
-# Output images
-*.png
+# Bryan extras
+**/assets/
+**/.uvcache/
+**/*.png
+**/*.tar
+**/outputs_24h/
+**/.git
+**/.gitignore
+**/Dockerfile
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -31,6 +37,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+assets/*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
